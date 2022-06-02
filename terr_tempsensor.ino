@@ -16,13 +16,11 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
+
 #include "NTP.h"
 
 #include "config.h"
 #include "icons.h"
-#include "persistent.hpp"
 #include "eeprom.hpp"
 
 #if defined(USE_UNO)
@@ -33,8 +31,15 @@
   #include <WiFi.h>
 #endif
 
-#include "WiFiUdp.h"
+#if defined(USE_BOSCH_TEMP)
+  #include <Adafruit_Sensor.h>
+  #include <Adafruit_BME280.h>
+#elif defined(USE_DALLAS_TEMP)
+  #include <OneWire.h>
+  #include <USE_DALLAS_TEMPTemperature.h>
+#endif
 
+#include "WiFiUdp.h"
 
 // ************************************************************************************
 // Globals
@@ -42,12 +47,17 @@
 
 WiFiClient wifiClient;
 MQTTClient client;
-Persistent persistence;
 Eeprom eeprom;
 WiFiUDP wifiUdp;
 NTP ntp(wifiUdp);
-OneWire oneWire(TEMP_SENSOR_PIN);
-DallasTemperature sensors(&oneWire);
+
+#if defined(USE_BOSCH_TEMP)
+  Adafruit_BME280 bme; // I2C
+#elif defined(USE_DALLAS_TEMP)
+  OneWire oneWire(TEMP_SENSOR_PIN);
+  USE_DALLAS_TEMPTemperature sensors(&oneWire);
+#endif
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 int wifiIconStep = 0;
@@ -57,9 +67,10 @@ char buffer[100+1];
 char deviceIdText[100+1];
 unsigned long deviceID = 0;
 unsigned long lastMeasure = 0;
-float lastValue = 0.0;
-float minValue = 0.0;
-float maxValue = 0.0;
+float lastTemperatureValue = 0.0;
+float minTemperatureValue = 0.0;
+float maxTemperatureValue = 0.0;
+float lastHumidityValue = 0.0;
 bool reInitMinMax = true;
 int currentDayNum = -1;
 
@@ -94,34 +105,37 @@ void setup()
     for(;;); // Don't proceed, loop forever
   }
 
+  PRINTLN("Starting temperature sensor");
+
+#ifdef USE_BOSCH_TEMP
+  bool status = bme.begin(0x76);
+  
+  if (!status) {
+    Serial.println("Could not find a valid BME280 sensor, check wiring!");
+    while (1);
+  }
+#endif
+
+#ifdef USE_DALLAS_TEMP
+  sensors.begin();
+#endif
+
   display.display();
   display.setTextColor(WHITE);
   delay(2000);
 
-  if (persistence.isInitialized())
+  eeprom.begin();
+  
+  if (eeprom.isInitialized())
   {
-    deviceID = persistence.getValue(Persistent::piDeviceId);
-
-    PRINTF("Read device ID 0x%x from persistence\n", deviceID);
+    deviceID = eeprom.getValue();
+    PRINTF("Read device ID 0x%x from EEPROM\n", deviceID);
   }
   else
   {
-    eeprom.begin();
-    
-    if (eeprom.isInitialized())
-    {
-      deviceID = eeprom.getValue();
-      PRINTF("Read device ID 0x%x from EEPROM\n", deviceID);
-
-      persistence.setValue(Persistent::piDeviceId, deviceID);
-    }
-    else
-    {
-      PRINTLN("Initializing EEPROM");
-      deviceID = random(2147483646);
-      eeprom.setValue(0, deviceID);
-    }
-
+    PRINTLN("Initializing EEPROM");
+    deviceID = random(2147483646);
+    eeprom.setValue(0, deviceID);
   }
 
   sprintf(deviceIdText, "ID: 0x%x\n", deviceID);
@@ -142,15 +156,6 @@ void setup()
   client.begin(MQTT_HOST, MQTT_PORT, wifiClient);
   client.setOptions(0, true, 360000);
 
-  bool succeeded = connect();
-
-  while (!succeeded) 
-  {
-      PRINTLN("Connect loop in setup");
-      delay(20000);
-      succeeded = connect();
-  }  
-
   PRINTLN("Starting NTP client");
   ntp.ruleDST("CEST", Last, Sun, Mar, 2, 120); // last sunday in march 2:00, timetone +120min (+1 GMT + 1h summertime offset)
   ntp.ruleSTD("CET", Last, Sun, Oct, 3, 60); // last sunday in october 3:00, timezone +60min (+1 GMT)
@@ -161,8 +166,6 @@ void setup()
   ntp.begin();
 #endif
   
-  PRINTLN("Starting temperature sensor");
-  sensors.begin();
   PRINTLN("UP");
 }
 
@@ -180,6 +183,18 @@ void loop()
     doMeasure();
   }
 
+#ifdef WIFI_ENABLED
+  if (!connected)
+  {
+    bool succeeded = connect();
+
+    if (!succeeded)
+    {
+      PRINTLN("Wifi connect failed, skipping NTP update/MQTT update");
+      return;
+    }
+  }
+
   ntp.update();
   client.loop();
   delay(250);
@@ -189,8 +204,8 @@ void loop()
   if (currentDayNum == -1 || currentDayNum != dayNum)
   {
     currentDayNum = dayNum;
-    minValue = 0.0;
-    maxValue = 0.0;
+    minTemperatureValue = 0.0;
+    maxTemperatureValue = 0.0;
     reInitMinMax = true;
   }
 
@@ -199,6 +214,7 @@ void loop()
     delay(2000);
     connect();
   }
+#endif
 }
 
 // ************************************************************************************
@@ -207,6 +223,7 @@ void loop()
 
 bool connect()
 {
+#ifdef WIFI_ENABLED  
   bool res = connectWIFI();
 
   if (!res)
@@ -214,14 +231,17 @@ bool connect()
     
   connectMQTT();
   updateDisplay();
+#endif
   return true;
 }
 
 void disconnect()
 {
+#ifdef WIFI_ENABLED
   disconnectMQTT(); 
   disconnectWIFI();
   updateDisplay();
+#endif
 }
 
 const char* status2Text(int status)
@@ -250,6 +270,7 @@ const char* status2Text(int status)
 
 bool connectWIFI()
 {
+#ifdef WIFI_ENABLED
   PRINTF("[WIFI] Connecting to network %s ...", WIFI_SSID);
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -271,15 +292,18 @@ bool connectWIFI()
   }
 
   PRINTLN(" connected");
+#endif
   return true;
 }
 
 void disconnectWIFI()
 {
+#ifdef WIFI_ENABLED
   PRINTF("[WIFI] Disconnecting to network %s ...\n", WIFI_SSID);
   WiFi.disconnect();
   PRINTLN("[WIFI] Disconnected");
   connected = false;
+#endif
 }
 
 // ************************************************************************************
@@ -288,6 +312,7 @@ void disconnectWIFI()
 
 void connectMQTT() 
 {
+#ifdef WIFI_ENABLED
   PRINTF("[MQTT] Connecting to host %s ...", MQTT_HOST);
 
   while (!client.connect(MQTT_ID)) 
@@ -299,14 +324,17 @@ void connectMQTT()
 
   connected = true;
   PRINTLN(" connected");
+#endif
 }
 
 void disconnectMQTT()
 {
+#ifdef WIFI_ENABLED
   PRINTF("[MQTT] Disonnecting from host %s ...\n", MQTT_HOST);
   client.disconnect();
   PRINTLN("[MQTT] Disconnected");
   connected = false;
+#endif
 }
 
 // ************************************************************************************
@@ -315,10 +343,28 @@ void disconnectMQTT()
 
 void doMeasure()
 {
+  float hum = 0.0;
+  float tempC = 0.0;
+  
+#ifdef USE_BOSCH_TEMP
+  tempC = bme.readTemperature();
+  hum = bme.readHumidity();
+
+  if (isnan(tempC) || isnan(hum))
+  {
+    sensorError = true;
+    updateDisplay();
+    PRINTLN("Error: Could not read temperature data");
+    return;
+  }
+#endif
+
+#ifdef USE_DALLAS_TEMP
+
   sensorError = false;
   sensors.requestTemperatures();
 
-  float tempC = sensors.getTempCByIndex(0);
+  tempC = sensors.getTempCByIndex(0);
  
   // Check if reading was successful
  
@@ -326,17 +372,19 @@ void doMeasure()
   {
     sensorError = true;
     updateDisplay();
-    Serial.println("Error: Could not read temperature data");
+    PRINTLN("Error: Could not read temperature data");
     return;
   }
+#endif
 
-  lastValue = tempC;
+  lastTemperatureValue = tempC;
+  lastHumidityValue = hum;
 
-  if (reInitMinMax || lastValue < minValue)
-    minValue = lastValue;
+  if (reInitMinMax || lastTemperatureValue < minTemperatureValue)
+    minTemperatureValue = lastTemperatureValue;
 
-  if (reInitMinMax || lastValue > maxValue)
-    maxValue = lastValue;
+  if (reInitMinMax || lastTemperatureValue > maxTemperatureValue)
+    maxTemperatureValue = lastTemperatureValue;
 
   reInitMinMax = false;
 
@@ -351,10 +399,10 @@ void doMeasure()
 void updateDisplay(int wifiNum)
 {
   display.clearDisplay();
-  display.setTextSize(2.5);
+  display.setTextSize(2.0);
   display.setTextColor(WHITE);
   display.setCursor(0,0);
-  sprintf(buffer, "%2.1f°C", lastValue);
+  sprintf(buffer, "%2.1f°C", lastTemperatureValue);
   display.printlnUTF8(buffer);
 
   if (wifiNum >= 0)
@@ -380,19 +428,31 @@ void updateDisplay(int wifiNum)
   }
     
   int xpos = 0;
-  int ypos = 48;
+  int ypos = 32;
+
+#ifdef USE_BOSCH_TEMP
+  display.drawBitmap(xpos, ypos+1, drop_icon16x16, 16, 16, SSD1306_WHITE);
+  xpos += 14;
+  display.setTextSize(1);
+  display.setCursor(xpos, ypos);
+  sprintf(buffer, "%2.0f%%", lastHumidityValue);
+  display.printlnUTF8(buffer);
+#endif
+
+  xpos = 0;
+  ypos = 48;
   display.drawBitmap(xpos, ypos+1, arrow_down_icon16x16, 16, 16, SSD1306_WHITE);
   xpos += 14;
   display.setTextSize(1);
   display.setCursor(xpos, ypos);
-  sprintf(buffer, "%2.1f°C", minValue);
+  sprintf(buffer, "%2.1f°C", minTemperatureValue);
   display.printlnUTF8(buffer);
   
   xpos += 51;
   display.drawBitmap(xpos, ypos+1, arrow_up_icon16x16, 16, 16, SSD1306_WHITE);
   xpos += 14;
   display.setCursor(xpos, ypos );
-  sprintf(buffer, "%2.1f°C", maxValue);
+  sprintf(buffer, "%2.1f°C", maxTemperatureValue);
   display.printlnUTF8(buffer);
   display.display();
 }
@@ -403,16 +463,30 @@ void updateDisplay(int wifiNum)
 
 bool updateMQTT()
 {
+  bool res = true;
+
+#ifdef WIFI_ENABLED
+  if (!connected)
+    return res;
+  
   char topicBuffer[200];
-  snprintf(buffer, 100, "{ \"value\": %2.2f }", lastValue);
+
+#if defined(USE_BOSCH_TEMP)
+  snprintf(buffer, 100, "{ \"temperature\": %2.2f, \"humidity\": %2.2f }", lastTemperatureValue, lastHumidityValue);
+#elif defined(USE_DALLAS_TEMP)
+  OneWire oneWire(TEMP_SENSOR_PIN);
+  snprintf(buffer, 100, "{ \"temperature\": %2.2f }", lastTemperatureValue);
+#endif
+
   snprintf(topicBuffer, 100, "%s/0x%x", TOPIC_STATE, deviceID);
 
-  bool res = client.publish(topicBuffer, buffer, true, 0);
+  res = client.publish(topicBuffer, buffer, true, 0);
 
   if (!res)
     PRINTLN("Failed to publish new sensor value");
   else
     PRINTF("-> %s [%s]\n", topicBuffer, buffer);
+#endif
 
   return res;
 }
