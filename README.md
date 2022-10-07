@@ -6,7 +6,9 @@ The version I have built for myself is used for my spider enclosure, and I am us
 
 Optionally, you can configure WiFi-credentials, in which case the sensor will enable NTP time synchronization, so you will be able to set a day/night time (without network access, Arduinos will be unable to know the time of day). In addition, in case you are running a MQTT broker in your network, you can configure the sensor to connect to it. In this case, it will periodically send messages to the MQTT broker containing the temperature/humidity reading. This makes it extremely easy to integrate into your Home Assistant or other smart home software.
 
-This repository also contains .STL files so you can 3D-print a case matching the components I have used
+This repository also contains .STL files so you can 3D-print a case matching the components I have used.
+
+<img title="Screenshot" alt="Screenshot" width="50%" src="photo.jpg">
 
 # Shopping list
 
@@ -149,3 +151,32 @@ The first two lines define the display dimensions, and the third line defines th
 
 The last two lines define the time during which the display is enabled. Outside of this timeframe the display will go dark. If you disable both lines, the display will be on 24h a day.
 The display can also be turned on/off via MQTT commands, see chapter **MQTT control messages**.
+
+# Home assistant integration
+
+Just add the following to your `configuration.yaml`: 
+
+```
+sensor:
+  - platform: mqtt
+    state_topic: 'ha/sensor/tempsensor/status/0x43ff863d'
+    json_attributes_topic: 'ha/sensor/tempsensor/status/0x43ff863d'
+    value_template: '{{value_json.temperature}}'
+    name: "Terrarium Temperature"
+    unit_of_measurement: '°C'
+    
+  - platform: mqtt
+    state_topic: 'ha/sensor/tempsensor/status/0x43ff863d'
+    json_attributes_topic: 'ha/sensor/tempsensor/status/0x43ff863d'
+    value_template: '{{value_json.humidity}}'
+    name: "Terrarium Humidity"
+    unit_of_measurement: '%'
+```
+
+The second sensor can be of course omitted when using the DS18B20 sensor, since it does not provide humidity readins.
+
+Of course, you're `configuration.yaml` needs to have the same MQTT broker configured you set in the `config.h` file.
+
+# Sensor case
+
+The files `case.STL` and `case_lid.STL` contain the parts which can be 3D printed to make a case for the sensor. The case was designed by Thomas Kleinknecht.
