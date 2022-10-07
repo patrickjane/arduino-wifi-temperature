@@ -16,6 +16,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <time.h>
 
 #include "NTP.h"
 
@@ -60,11 +61,17 @@ NTP ntp(wifiUdp);
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-int wifiIconStep = 0;
+short wifiIconStep = 0;
+unsigned short sensorErrors = 0;
+bool nightMode = false;
+time_t displayStart = 0;
+time_t displayEnd = 0;
+struct tm timeStruct;
 bool connected = false;
 bool sensorError = false;
 char buffer[100+1];
-char deviceIdText[100+1];
+char deviceIdText[30+1];
+char currentTimeString[7];
 unsigned long deviceID = 0;
 unsigned long lastMeasure = 0;
 float lastTemperatureValue = 0.0;
@@ -72,7 +79,7 @@ float minTemperatureValue = 0.0;
 float maxTemperatureValue = 0.0;
 float lastHumidityValue = 0.0;
 bool reInitMinMax = true;
-int currentDayNum = -1;
+short currentDayNum = -1;
 
 // ************************************************************************************
 // Functions
@@ -86,6 +93,8 @@ void disconnectWIFI();
 void doMeasure();
 bool updateMQTT();
 void updateDisplay(int wifiNum = -1);
+void setNightMode(unsigned long fromHour, unsigned long fromMinute, unsigned long toHour, unsigned long toMinute);
+void setNightMode(const char* from, const char* to, bool saveToEeprom, bool off = false);
 
 // ************************************************************************************
 // Setup
@@ -94,21 +103,25 @@ void updateDisplay(int wifiNum = -1);
 void setup()
 {
 #ifdef SS_DEBUG
-  Serial.begin(115200);
+  Serial.begin(9600);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB
   }
 #endif
+
+  PRINTLN("Init display");
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     PRINTLN(F("SSD1306 allocation failed"));
     for(;;); // Don't proceed, loop forever
   }
 
+  memset(currentTimeString, 0, sizeof(currentTimeString));
+
   PRINTLN("Starting temperature sensor");
 
 #ifdef USE_BOSCH_TEMP
-  bool status = bme.begin(0x76);
+  bool status = bme.begin(SENSOR_ADDRESS);
   
   if (!status) {
     Serial.println("Could not find a valid BME280 sensor, check wiring!");
@@ -122,20 +135,50 @@ void setup()
 
   display.display();
   display.setTextColor(WHITE);
+  display.ssd1306_command(SSD1306_SETCONTRAST); 
+  display.ssd1306_command(1);
   delay(2000);
 
   eeprom.begin();
   
   if (eeprom.isInitialized())
   {
-    deviceID = eeprom.getValue();
+    deviceID = eeprom.getValue(eiDeviceID);
     PRINTF("Read device ID 0x%x from EEPROM\n", deviceID);
+
+    unsigned long fromHour = eeprom.getValue(eiNightModeStartHour);
+    unsigned long fromMinute = eeprom.getValue(eiNightModeStartMinute);
+    unsigned long toHour = eeprom.getValue(eiNightModeEndHour);
+    unsigned long toMinute = eeprom.getValue(eiNightModeEndMinute);
+
+    if (fromHour < 30)
+    {
+      setNightMode(fromHour, fromMinute, toHour, toMinute);
+    }
+#if defined(DISPLAY_START) && defined(DISPLAY_END)
+    else if (fromHour != 777)
+    {
+      setNightMode(DISPLAY_START, DISPLAY_END, false);
+    }
+#endif    
   }
   else
   {
     PRINTLN("Initializing EEPROM");
     deviceID = random(2147483646);
-    eeprom.setValue(0, deviceID);
+    eeprom.setCookie();
+    eeprom.setValue(eiDeviceID, deviceID);
+
+#if defined(DISPLAY_START) && defined(DISPLAY_END)
+    setNightMode(DISPLAY_START, DISPLAY_END, true);
+#else
+    eeprom.setValue(eiNightModeStartHour, 100);
+    eeprom.setValue(eiNightModeStartMinute, 100);
+    eeprom.setValue(eiNightModeEndHour, 100);
+    eeprom.setValue(eiNightModeEndMinute, 100);
+#endif
+
+    eeprom.commit();
   }
 
   sprintf(deviceIdText, "ID: 0x%x\n", deviceID);
@@ -155,6 +198,9 @@ void setup()
 
   client.begin(MQTT_HOST, MQTT_PORT, wifiClient);
   client.setOptions(0, true, 360000);
+#ifdef TOPIC_CONTROL  
+  client.onMessageAdvanced(onMessageReceived);
+#endif
 
   PRINTLN("Starting NTP client");
   ntp.ruleDST("CEST", Last, Sun, Mar, 2, 120); // last sunday in march 2:00, timetone +120min (+1 GMT + 1h summertime offset)
@@ -175,12 +221,16 @@ void setup()
 
 void loop()
 {
-  delay(500);
+  static int lastMinute = -1;
 
   if (!lastMeasure || (millis() - lastMeasure) >= MEASURE_EVERY_SECONDS)
   {
     lastMeasure = millis();
     doMeasure();
+
+#ifdef WIFI_ENABLED
+    ntp.update();
+#endif
   }
 
 #ifdef WIFI_ENABLED
@@ -195,7 +245,6 @@ void loop()
     }
   }
 
-  ntp.update();
   client.loop();
   delay(250);
 
@@ -209,7 +258,34 @@ void loop()
     reInitMinMax = true;
   }
 
+  timeStruct.tm_hour = ntp.hours();
+  timeStruct.tm_min = ntp.minutes();
+  time_t nowTime = mktime(&timeStruct);
+
+  snprintf(currentTimeString, 6, "%0.2d:%0.2d", ntp.hours(), ntp.minutes());
+
+  if (lastMinute != ntp.minutes())
+  {
+    updateDisplay();
+    lastMinute = ntp.minutes();
+  }
+  
+  bool nightModeNow = displayStart != 0 && !(nowTime >= displayStart && nowTime < displayEnd);
+
+  if (nightModeNow != nightMode)
+  {
+    if (nightModeNow)
+      display.dim(true);
+    else
+      display.dim(false);
+
+    nightMode = nightModeNow;
+    
+    PRINTF("Night mode switched to: %s\n", nightMode ? "on" : "off");
+  }      
+
   if (!client.connected()) {
+    PRINTLN("MQTT client lost connection, disconnecting WiFi and trying to reconnect ...");
     disconnect();
     delay(2000);
     connect();
@@ -228,7 +304,8 @@ bool connect()
 
   if (!res)
     return res;
-    
+
+  ntp.update();
   connectMQTT();
   updateDisplay();
 #endif
@@ -322,8 +399,23 @@ void connectMQTT()
     delay(400);
   }
 
+  PRINTLN(" connected");  
+
+#ifdef TOPIC_CONTROL
+  char topicBuffer[200];
+  snprintf(topicBuffer, 200, "%s/0x%x", TOPIC_CONTROL, deviceID);
+  
+  PRINTF("[MQTT] Subscribing to control topic %s ...\n", topicBuffer);
+  
+  if (!client.subscribe(topicBuffer))
+  {
+    PRINT(".");
+    updateDisplay(wifiIconStep++);
+    delay(400);
+  }  
+#endif
+
   connected = true;
-  PRINTLN(" connected");
 #endif
 }
 
@@ -345,6 +437,9 @@ void doMeasure()
 {
   float hum = 0.0;
   float tempC = 0.0;
+  bool hadSensorError = sensorError;
+
+  sensorError = false;
   
 #ifdef USE_BOSCH_TEMP
   tempC = bme.readTemperature();
@@ -352,6 +447,9 @@ void doMeasure()
 
   if (isnan(tempC) || isnan(hum))
   {
+    if (!hadSensorError)
+      sensorErrors++;
+
     sensorError = true;
     updateDisplay();
     PRINTLN("Error: Could not read temperature data");
@@ -360,8 +458,6 @@ void doMeasure()
 #endif
 
 #ifdef USE_DALLAS_TEMP
-
-  sensorError = false;
   sensors.requestTemperatures();
 
   tempC = sensors.getTempCByIndex(0);
@@ -370,6 +466,9 @@ void doMeasure()
  
   if (tempC == DEVICE_DISCONNECTED_C) 
   {
+    if (!hadSensorError)
+      sensorErrors++;
+    
     sensorError = true;
     updateDisplay();
     PRINTLN("Error: Could not read temperature data");
@@ -411,20 +510,20 @@ void updateDisplay(int wifiNum)
   
     switch (_wifiNum)
     {
-      case 1: display.drawBitmap(128-16, 0, wifi1_icon16x16, 16, 16, SSD1306_WHITE); break;
-      case 2: display.drawBitmap(128-16, 0, wifi2_icon16x16, 16, 16, SSD1306_WHITE); break;
-      case 3: display.drawBitmap(128-16, 0, wifi3_icon16x16, 16, 16, SSD1306_WHITE); break;
+      case 1: display.drawBitmap(128-16, 8, wifi1_icon16x16, 16, 16, SSD1306_WHITE); break;
+      case 2: display.drawBitmap(128-16, 8, wifi2_icon16x16, 16, 16, SSD1306_WHITE); break;
+      case 3: display.drawBitmap(128-16, 8, wifi3_icon16x16, 16, 16, SSD1306_WHITE); break;
       default: break;
     }
   } 
   else if (connected)
   {
-    display.drawBitmap(128-16, 0, wifi3_icon16x16, 16, 16, SSD1306_WHITE);
+    display.drawBitmap(128-16, 8, wifi3_icon16x16, 16, 16, SSD1306_WHITE);
   }
 
   if (sensorError) 
   {
-    display.drawBitmap(128-16, 20, noconnection_icon16x16, 16, 16, SSD1306_WHITE);
+    display.drawBitmap(128-16, 28, noconnection_icon16x16, 16, 16, SSD1306_WHITE);
   }
     
   int xpos = 0;
@@ -435,10 +534,18 @@ void updateDisplay(int wifiNum)
   xpos += 14;
   display.setTextSize(1);
   display.setCursor(xpos, ypos);
-  sprintf(buffer, "%2.0f%%", lastHumidityValue);
+  sprintf(buffer, "%.0f%%", lastHumidityValue);
   display.printlnUTF8(buffer);
 #endif
 
+  if (strlen(currentTimeString))
+  {
+    xpos += 53;
+    display.setTextSize(1);
+    display.setCursor(xpos, ypos);
+    display.printlnUTF8(currentTimeString);
+  }
+  
   xpos = 0;
   ypos = 48;
   display.drawBitmap(xpos, ypos+1, arrow_down_icon16x16, 16, 16, SSD1306_WHITE);
@@ -472,15 +579,14 @@ bool updateMQTT()
   char topicBuffer[200];
 
 #if defined(USE_BOSCH_TEMP)
-  snprintf(buffer, 100, "{ \"temperature\": %2.2f, \"humidity\": %2.2f }", lastTemperatureValue, lastHumidityValue);
+  snprintf(buffer, 100, "{ \"temperature\": %2.2f, \"humidity\": %2.2f, \"errors\": %d }", lastTemperatureValue, lastHumidityValue, sensorErrors);
 #elif defined(USE_DALLAS_TEMP)
-  OneWire oneWire(TEMP_SENSOR_PIN);
-  snprintf(buffer, 100, "{ \"temperature\": %2.2f }", lastTemperatureValue);
+  snprintf(buffer, 100, "{ \"temperature\": %2.2f, \"errors\": %d }", lastTemperatureValue, sensorErrors);
 #endif
 
   snprintf(topicBuffer, 100, "%s/0x%x", TOPIC_STATE, deviceID);
 
-  res = client.publish(topicBuffer, buffer, true, 0);
+  res = client.publish(topicBuffer, buffer, false, 0);
 
   if (!res)
     PRINTLN("Failed to publish new sensor value");
@@ -489,4 +595,210 @@ bool updateMQTT()
 #endif
 
   return res;
+}
+
+// ************************************************************************************
+// onMessageReceived
+// ************************************************************************************
+
+void onMessageReceived(MQTTClient* client, char* topic, char* payload, int payload_length) 
+{
+  char topicBuffer[200];
+  snprintf(topicBuffer, 200, "%s/0x%x", TOPIC_CONTROL, deviceID);
+    
+  if (strcmp(topic ? topic : "", topicBuffer))
+  {
+    PRINTF("Ignoring message for unexpected topic %s\n", topic ? topic : "");
+    return;
+  }
+  
+  if (!payload || !*payload)
+  {
+    PRINTF("Ignoring message without payload\n");
+    return;
+  }
+
+  char command[30+1]; *command = 0;
+
+  if (!getJsonValue(payload, "command", command, 30))
+  {
+    PRINTF("Ignoring message without 'command' property\n");
+    return;
+  }
+
+  if (!strcmp(command, "setNightMode"))
+  {
+    char from[10]; *from= 0;
+    char to[10]; *to= 0;
+    char off[10]; *off= 0;    
+
+    if (!getJsonValue(payload, "from", from, 10) && !getJsonValue(payload, "off", off, 10))
+    {
+      PRINTF("Ignoring setNightMode message without 'from'/'off' property\n");
+      return;
+    }
+
+    if (!strcmp(off, "true"))
+    {
+      setNightMode("", "", true, true);
+      eeprom.commit();
+      return;
+    }
+
+    if (!getJsonValue(payload, "to", to, 10))
+    {
+      PRINTF("Ignoring setNightMode message without 'to' property\n");
+      return;
+    }
+
+    setNightMode(from, to, true);
+    eeprom.commit();
+  }
+
+  if (!strcmp(command, "display"))
+  {
+    char off[10]; *off= 0;    
+
+    if (!getJsonValue(payload, "off", off, 10))
+    {
+      PRINTF("Ignoring display message without 'off' property\n");
+      return;
+    }
+
+    if (!strcmp(off, "true"))
+      display.dim(true);
+    else
+      display.dim(false);
+  }  
+}
+
+// ************************************************************************************
+// setNightMode
+// ************************************************************************************
+
+void setNightMode(const char* from, const char* to, bool saveToEeprom, bool off)
+{
+  if (off)
+  {
+    if (saveToEeprom)
+    {
+      eeprom.setValue(eiNightModeStartHour, 777);
+      eeprom.setValue(eiNightModeStartMinute, 777);
+      eeprom.setValue(eiNightModeEndHour, 777);
+      eeprom.setValue(eiNightModeEndMinute, 777);
+      displayStart = displayEnd = 0;
+
+      PRINTF("Display now always on\n");
+    }
+    
+    return;  
+  }
+  
+  if (!from || !*from || !to || !*to || strlen(from) != 5 || strlen(to) != 5)
+    return;
+    
+  char buf1[50];
+  char buf2[50];
+
+  memset(&timeStruct, 0, sizeof(struct tm));
+
+  timeStruct.tm_hour = atoi(from);
+  timeStruct.tm_min = atoi(from+3);
+  displayStart = mktime(&timeStruct);
+
+  if (saveToEeprom)
+  {
+    eeprom.setValue(eiNightModeStartHour, timeStruct.tm_hour);
+    eeprom.setValue(eiNightModeStartMinute, timeStruct.tm_min);
+  }
+
+  strftime(buf1, 50, "%R", &timeStruct);  
+
+  timeStruct.tm_hour = atoi(to);
+  timeStruct.tm_min = atoi(to+3);
+  displayEnd = mktime(&timeStruct);
+
+  if (saveToEeprom)
+  {
+    eeprom.setValue(eiNightModeEndHour, timeStruct.tm_hour);
+    eeprom.setValue(eiNightModeEndMinute, timeStruct.tm_min);
+  }
+
+  strftime(buf2, 50, "%R", &timeStruct);  
+
+  PRINTF("Display on between %s - %s\n", buf1, buf2);
+}
+
+void setNightMode(unsigned long fromHour, unsigned long fromMinute, unsigned long toHour, unsigned long toMinute)
+{
+  char buf1[50];
+  char buf2[50];
+
+  memset(&timeStruct, 0, sizeof(struct tm));
+
+  timeStruct.tm_hour = fromHour;
+  timeStruct.tm_min = fromMinute;
+  displayStart = mktime(&timeStruct);
+
+  strftime(buf1, 50, "%R", &timeStruct);  
+
+  timeStruct.tm_hour = toHour;
+  timeStruct.tm_min = toMinute;
+  displayEnd = mktime(&timeStruct);
+
+  strftime(buf2, 50, "%R", &timeStruct);  
+
+  PRINTF("Display on between %s - %s (e)\n", buf1, buf2);
+}
+
+// ************************************************************************************
+// getJsonValue
+// ************************************************************************************
+
+bool getJsonValue(const char* source, const char* property, char* dest, int destLen)
+{
+  if (!source || !strlen(source))
+    return false;
+
+  char* p = strstr(source, property);
+  char* p2;
+
+  if (!p)
+    return false;
+
+  p += strlen(property);
+
+  while (*p && (*p == ' ' ||  *p == ':' || *p == '"'))
+    p++;
+
+  if (!(*p))
+    return false;
+
+  bool isString = *(p-1) == '"';
+  p2 = p;
+
+  if (isString)
+  {
+    while (*p && (*p != '"' || *(p-1) == '\\'))
+      p++;
+  }
+  else
+  {
+    while (*p && *p != ',' && *p != ' ' && *p != '}' && *p != ']')
+      p++;
+  }
+
+  if (!(*p))
+    return false;
+
+  int valueLen = p - p2;
+
+  if (valueLen > 0 && valueLen < destLen+1)
+  {
+    strncpy(dest, p2, valueLen);
+    dest[valueLen] = 0;
+    return true;
+  }
+
+  return false;
 }

@@ -7,7 +7,7 @@
 // Copyright (c) 2021 - Patrick Fial
 // ************************************************************************************
 
-#define EEPROM_SIZE sizeof(short) + sizeof(long)
+#define EEPROM_SIZE sizeof(short) + 10*sizeof(unsigned long)
 #define EEPROM_COOKIE 8472
 
 // ************************************************************************************
@@ -50,7 +50,7 @@ unsigned long Eeprom::getValue(int index)
 
   unsigned long res = -1;
 
-  EEPROM.get(sizeof(short), res);  
+  EEPROM.get(sizeof(short) + index*sizeof(unsigned long), res);  
 
   return res;
 }
@@ -59,10 +59,26 @@ unsigned long Eeprom::getValue(int index)
 // setValue
 // ************************************************************************************
 
-void Eeprom::setValue(int index, unsigned long to)
+void Eeprom::setCookie()
 {
   short cookie = EEPROM_COOKIE;
   EEPROM.put(0, cookie);
-  EEPROM.put(sizeof(short) + index*sizeof(int), to);
+}
+
+// ************************************************************************************
+// setValue
+// ************************************************************************************
+
+void Eeprom::setValue(int index, unsigned long to)
+{
+  EEPROM.put(sizeof(short) + index*sizeof(unsigned long), to);
+}
+
+// ************************************************************************************
+// setValue
+// ************************************************************************************
+
+void Eeprom::commit()
+{
   EEPROM.commit();
 }
